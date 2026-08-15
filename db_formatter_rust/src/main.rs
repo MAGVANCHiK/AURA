@@ -1,11 +1,12 @@
 use core::str;
 use rayon::prelude::*;
 // use serde::Serialize;
+use clickhouse::{Client, Row};
 use std::io::BufReader;
 use std::{error::Error, fs::File, print, println};
 
-// #[derive(Debug, Default, clickhouse::Row, serde::Serialize)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, clickhouse::Row, serde::Serialize)]
+// #[derive(Debug, Default)]
 pub struct Person {
     pub phone: u64,
     pub email: String,
@@ -29,6 +30,14 @@ pub struct Person {
     pub extra: String, // Сюда закинем JSON со всем остальным
 }
 
+fn create_client() -> Client {
+    Client::default()
+        .with_url("http://127.0.0.0:8123")
+        .with_user("default")
+        .with_password("")
+        .with_database("aura")
+}
+
 fn phone(phone_number: &str) -> String {
     // 1. Оставляем только цифры
     let digits: String = phone_number
@@ -42,8 +51,8 @@ fn phone(phone_number: &str) -> String {
     }
 
     // 3. Нормализуем первую цифру (7 или 8 переводим в 8)
-    if digits.starts_with('7') || digits.starts_with('8') {
-        format!("7{}", &digits[1..])
+    if digits.starts_with('7') || digits.starts_with('8') && digits.len() == 11 {
+        return format!("7{}", &digits[1..]);
     } else {
         digits
     }
@@ -116,6 +125,7 @@ fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
         birth_day: day,
         birth_month: month,
         birth_year: year,
+
         ..Default::default()
     };
     current_person
@@ -145,6 +155,11 @@ fn db_reader(db_name: &str) -> Result<(), Box<dyn Error>> {
                 processed_chunk.len()
             );
 
+            let client = create_client();
+            push_to_click_db(client, processed_chunk);
+
+            println!("Чанк загружен в DB!");
+
             raw_chunk.clear();
         }
     }
@@ -164,9 +179,20 @@ fn db_reader(db_name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn main() {
-    match db_reader("trash-dbs/test_full.csv") {
-        Ok(()) => println!("Sucess"), //
-        Err(err) => println!("error running example: {}", err),
+async fn push_to_click_db(client: &Client, push_vec: Vec<Person>) {
+    let mut insert = client.insert("push_vec");
+    for record in push_vec {
+        insert.write(record).await?;
     }
+    insert.end().await?;
+}
+
+async fn main() {
+    let client = create_client();
+    db_reader("trash-dbs/test_full.csv");
+
+    // match db_reader("trash-dbs/test_full.csv") {
+    //     Ok(()) => println!("Sucess"),
+    //     Err(err) => println!("error running example: {}", err),
+    // }
 }
