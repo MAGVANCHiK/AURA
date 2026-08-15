@@ -1,24 +1,32 @@
 use core::str;
 use rayon::prelude::*;
+// use serde::Serialize;
 use std::io::BufReader;
 use std::{error::Error, fs::File, print, println};
 
+// #[derive(Debug, Default, clickhouse::Row, serde::Serialize)]
 #[derive(Debug, Default)]
-struct Person {
-    name: Option<String>,
-    surname: Option<String>,
-    patronymic: Option<String>,
-    birth_year: Option<String>,
-    birth_month: Option<String>,
-    birth_day: Option<String>,
-    phone: Option<String>,
-    mail: Option<String>,
-    address: Option<String>,
-    username: Option<String>,
-    passport: Option<String>,
-    snils: Option<String>,
-    inn: Option<String>,
-    other: Vec<(String, String)>,
+pub struct Person {
+    pub phone: u64,
+    pub email: String,
+    pub username: String,
+
+    pub surname: String,
+    pub name: String,
+    pub patronymic: String,
+    pub birth_day: u8,
+    pub birth_month: u8,
+    pub birth_year: u16,
+
+    pub passport: String,
+    pub inn: String,
+    pub snils: String,
+    pub car_number: String,
+
+    pub telegram_id: i64,
+    pub source_id: String,
+
+    pub extra: String, // Сюда закинем JSON со всем остальным
 }
 
 fn phone(phone_number: &str) -> String {
@@ -35,7 +43,7 @@ fn phone(phone_number: &str) -> String {
 
     // 3. Нормализуем первую цифру (7 или 8 переводим в 8)
     if digits.starts_with('7') || digits.starts_with('8') {
-        format!("8{}", &digits[1..])
+        format!("7{}", &digits[1..])
     } else {
         digits
     }
@@ -45,51 +53,65 @@ fn phone(phone_number: &str) -> String {
 
 // }
 
-fn birth(birth_day: &str) -> Vec<String> {
-    birth_day.split('-').map(|s| s.to_string()).collect()
+fn parse_birth(birth_str: &str) -> (u16, u8, u8) {
+    // Разбиваем по '-', '.', '/'
+    let parts: Vec<&str> = birth_str
+        .split(|c| c == '-' || c == '.' || c == '/')
+        .collect();
+
+    match parts.as_slice() {
+        // Если дата пришла как YYYY-MM-DD
+        [y, m, d] if y.len() == 4 => (
+            y.parse::<u16>().unwrap_or(0),
+            m.parse::<u8>().unwrap_or(0),
+            d.parse::<u8>().unwrap_or(0),
+        ),
+        // Если дата пришла как DD-MM-YYYY
+        [d, m, y] if y.len() == 4 => (
+            y.parse::<u16>().unwrap_or(0),
+            m.parse::<u8>().unwrap_or(0),
+            d.parse::<u8>().unwrap_or(0),
+        ),
+        _ => (0, 0, 0),
+    }
 }
 
 fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
     let raw_birth = row
         .get(5)
         .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or("".to_string());
-    let birth_days: Vec<String> = birth(&raw_birth);
-    let (year, month, day) = match birth_days.as_slice() {
-        [y, m, d] => (
-            Some(y.to_string()),
-            Some(m.to_string()),
-            Some(d.to_string()),
-        ),
-        _ => (None, None, None),
-    };
+        .unwrap_or_default();
+    let (year, month, day) = parse_birth(&raw_birth);
     let current_person = Person {
         phone: row
             .get(7)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .filter(|s| !s.is_empty())
-            // .map(|s| phone(s))
-            .filter(|p| !p.is_empty()),
-        mail: row
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim())
+            .map(|s| phone(s))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0),
+        email: row
             .get(8)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .filter(|s| !s.is_empty()),
-        // .map(|s| s.to_string()),
-        // fio
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default(),
         surname: row
             .get(2)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .filter(|s| !s.is_empty()),
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default(),
         // .map(|s| s.to_string()),
         name: row
             .get(3)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .filter(|s| !s.is_empty()),
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default(),
         // .map(|s| s.to_string()),
         patronymic: row
             .get(4)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .filter(|s| !s.is_empty()),
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default(),
         // birth
         birth_day: day,
         birth_month: month,

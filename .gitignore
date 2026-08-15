@@ -13,6 +13,11 @@ Cargo.lock
 *.sql
 *.db
 
+#Docker
+
+**/ch_data
+**/ch_logs
+
 # ClickHouse файлы
 *.bin
 *.mrk
