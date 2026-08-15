@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Твои бампы, архивы и файлы баз
+/trash-dbs/
+/data/
+*.csv
+*.rar
+*.zip
+*.7z
+*.sql
+*.db
+
+# ClickHouse файлы
+*.bin
+*.mrk
+**/clickhouse-data/
+
+# Временные файлы ОС и IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Логи и конфиги с ключами
+*.log
+.env
