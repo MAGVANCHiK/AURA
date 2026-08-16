@@ -1,6 +1,7 @@
 use clickhouse::{Client, Row};
 use core::str;
 use rayon::prelude::*;
+use std::collections::btree_map::Range;
 use std::io::BufReader;
 use std::path::Path;
 use std::{error::Error, fs::File, print, println};
@@ -29,6 +30,22 @@ pub struct Person {
     pub source_id: String,
 
     pub extra: String, // Сюда закинем JSON со всем остальным
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ColumnMapping {
+    pub fio: Option<usize>,
+    pub name: Option<usize>,
+    pub surname: Option<usize>,
+    pub patronymic: Option<usize>,
+    pub phone: Option<usize>,
+    pub email: Option<usize>,
+    pub passport: Option<usize>,
+    pub inn: Option<usize>,
+    pub snils: Option<usize>,
+    pub birth_date: Option<usize>,
+    pub car_number: Option<usize>,
+    pub telegram_id: Option<usize>,
 }
 
 #[derive(Debug, clickhouse::Row, serde::Serialize)]
@@ -96,12 +113,16 @@ fn parse_birth(birth_str: &str) -> (u16, u8, u8) {
     }
 }
 
-fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
+fn parse_row_to_person(row: &csv::ByteRecord, column_mapping: &ColumnMapping) -> Person {
     let raw_birth = row
         .get(5)
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
     let (year, month, day) = parse_birth(&raw_birth);
+
+    let used = [2, 3, 4, 7, 8];
+
+    let extra_collect: Vec<String> = Vec::new();
 
     let current_person = Person {
         phone: row
@@ -133,6 +154,7 @@ fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
             .and_then(|b| std::str::from_utf8(b).ok())
             .map(|s| s.trim().to_lowercase())
             .unwrap_or_default(),
+
         // birth
         birth_day: day,
         birth_month: month,
@@ -141,11 +163,10 @@ fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
         ..Default::default()
     };
 
-    let used = [2, 3, 4, 7, 8];
     current_person
 }
 
-fn db_reader(db_name: &str) -> Result<(), Box<dyn Error>> {
+async fn db_reader(db_name: &str, column_mapping: &ColumnMapping) -> Result<(), Box<dyn Error>> {
     println!("Начало читки файла!");
     let mut raw_chunk: Vec<csv::ByteRecord> = Vec::with_capacity(100_000);
     let db = File::open(db_name)?;
@@ -161,7 +182,7 @@ fn db_reader(db_name: &str) -> Result<(), Box<dyn Error>> {
             println!("Пошла обработка миллиона!");
             let processed_chunk: Vec<Person> = raw_chunk
                 .par_iter()
-                .map(|row| parse_row_to_person(row))
+                .map(|row| parse_row_to_person(row, column_mapping))
                 .collect();
 
             println!(
@@ -170,7 +191,7 @@ fn db_reader(db_name: &str) -> Result<(), Box<dyn Error>> {
             );
 
             let client = create_client();
-            push_to_click_db(client, processed_chunk);
+            push_to_click_db(&client, processed_chunk).await;
 
             println!("Чанк загружен в DB!");
 
@@ -193,12 +214,12 @@ fn db_reader(db_name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn push_to_click_db(client: &Client, push_vec: Vec<Person>) {
-    let mut insert = client.insert("push_vec");
+async fn push_to_click_db(client: &clickhouse::Client, push_vec: Vec<Person>) {
+    let mut insert = client.insert::<Person>("records").await.unwrap();
     for record in push_vec {
-        insert.write(record).await?;
+        insert.write(&record).await.unwrap();
     }
-    insert.end().await?;
+    insert.end().await.unwrap();
 }
 
 async fn get_meta(name: String, description: String, leak_date: String) {}
@@ -210,8 +231,18 @@ fn ask(prompt: &str) -> String {
     s.trim().to_string()
 }
 
-async fn main() {
-    let name = ask("name:");
+fn ask_idx(prompt: &str) -> Option<usize> {
+    let input = ask(prompt);
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<usize>().ok()
+    }
+}
+
+fn main() {
+    let db_name = ask("name:");
     let description = ask("description:");
     let leak_date = ask("leak_date (YYYY-MM-DD):");
     let db_path = ask("DB path (trash-dbs/cdek2021/):");
@@ -222,15 +253,72 @@ async fn main() {
 
     println!("Start parsing!");
     let mut is_first: bool = true;
-    for part in fs::read_dir(db_path)? {
+    let mut headers: Vec<String> = Vec::new();
+    let mut column_mapping: ColumnMapping = ColumnMapping::default();
+    // [id, fio....] from csv
+
+    for part in fs::read_dir(&db_path).unwrap() {
+        let path_db = part.unwrap().path();
         if is_first {
             let mut rdr = csv::ReaderBuilder::new()
                 .has_headers(false)
-                .from_path(&part)?;
-            let headers = rdr.headers().to_str();
+                .from_path(&path_db);
+            headers = rdr
+                .unwrap()
+                .headers()
+                .unwrap()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            // creating map for headers, aka name=1,surname=2,emain=7,number=8
+            for (i, h) in headers.iter().enumerate() {
+                println!("[{}] {}", i, h);
+            }
+            let fio_type = ask("1) fio; \n2) name, surname, patronymic\n Enter to pass: ");
+
+            let mut fio: Option<usize> = None;
+
+            let mut name: Option<usize> = None;
+            let mut surname: Option<usize> = None;
+            let mut patronymic: Option<usize> = None;
+
+            if fio_type.trim() == "1" {
+                fio = ask_idx("fio: ");
+            } else if fio_type.trim() == "2" {
+                name = ask_idx("name: ");
+                surname = ask_idx("surname: ");
+                patronymic = ask_idx("patronymic: ");
+            } else {
+            }
+
+            let phone = ask_idx("mobile phone: ");
+            let email = ask_idx("email phone: ");
+            let passport = ask_idx("passport: ");
+            let inn = ask_idx("inn: ");
+            let snils = ask_idx("snils: ");
+            let birth_date = ask_idx("birth_day: ");
+            let car_number = ask_idx("car_number: ");
+            let telegram_id = ask_idx("telegram_id: ");
+
+            column_mapping = ColumnMapping {
+                fio: fio,
+                name: name,
+                surname: surname,
+                patronymic: patronymic,
+                phone: phone,
+                email: email,
+                passport: passport,
+                inn: inn,
+                snils: snils,
+                birth_date: birth_date,
+                car_number: car_number,
+                telegram_id: telegram_id,
+            };
         }
+
         is_first = false;
-        db_reader(&(part.path().is_file()));
+        db_reader(path_db.to_str().unwrap(), &column_mapping);
     }
 
     // match db_reader("trash-dbs/test_full.csv") {
