@@ -1,9 +1,10 @@
+use clickhouse::{Client, Row};
 use core::str;
 use rayon::prelude::*;
-// use serde::Serialize;
-use clickhouse::{Client, Row};
 use std::io::BufReader;
+use std::path::Path;
 use std::{error::Error, fs::File, print, println};
+use std::{fs, io};
 
 #[derive(Debug, Default, clickhouse::Row, serde::Serialize)]
 // #[derive(Debug, Default)]
@@ -28,6 +29,16 @@ pub struct Person {
     pub source_id: String,
 
     pub extra: String, // Сюда закинем JSON со всем остальным
+}
+
+#[derive(Debug, clickhouse::Row, serde::Serialize)]
+pub struct Meta {
+    pub source_id: String,
+    pub name: String,
+    pub description: String,
+    pub leak_date: String,
+    pub record_count: u64,
+    pub schema_mapping: String,
 }
 
 fn create_client() -> Client {
@@ -91,6 +102,7 @@ fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
     let (year, month, day) = parse_birth(&raw_birth);
+
     let current_person = Person {
         phone: row
             .get(7)
@@ -128,6 +140,8 @@ fn parse_row_to_person(row: &csv::ByteRecord) -> Person {
 
         ..Default::default()
     };
+
+    let used = [2, 3, 4, 7, 8];
     current_person
 }
 
@@ -187,9 +201,37 @@ async fn push_to_click_db(client: &Client, push_vec: Vec<Person>) {
     insert.end().await?;
 }
 
+async fn get_meta(name: String, description: String, leak_date: String) {}
+
+fn ask(prompt: &str) -> String {
+    print!("{}", prompt);
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).ok();
+    s.trim().to_string()
+}
+
 async fn main() {
-    let client = create_client();
-    db_reader("trash-dbs/test_full.csv");
+    let name = ask("name:");
+    let description = ask("description:");
+    let leak_date = ask("leak_date (YYYY-MM-DD):");
+    let db_path = ask("DB path (trash-dbs/cdek2021/):");
+    let source_id = Path::new(&db_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    println!("Start parsing!");
+    let mut is_first: bool = true;
+    for part in fs::read_dir(db_path)? {
+        if is_first {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_path(&part)?;
+            let headers = rdr.headers().to_str();
+        }
+        is_first = false;
+        db_reader(&(part.path().is_file()));
+    }
 
     // match db_reader("trash-dbs/test_full.csv") {
     //     Ok(()) => println!("Sucess"),
