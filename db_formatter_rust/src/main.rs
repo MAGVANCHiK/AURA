@@ -1,11 +1,12 @@
 use clickhouse::{Client, Row};
 use core::str;
 use rayon::prelude::*;
+use serde_json::{de, value};
 use std::collections::btree_map::Range;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::Path;
+use std::{clone, fs, io};
 use std::{error::Error, fs::File, print, println};
-use std::{fs, io};
 
 #[derive(Debug, Default, clickhouse::Row, serde::Serialize)]
 // #[derive(Debug, Default)]
@@ -48,21 +49,20 @@ pub struct ColumnMapping {
     pub telegram_id: Option<usize>,
 }
 
-#[derive(Debug, clickhouse::Row, serde::Serialize)]
+#[derive(Debug, clickhouse::Row, serde::Serialize, Default)]
 pub struct Meta {
     pub source_id: String,
     pub name: String,
     pub description: String,
-    pub leak_date: String,
-    pub record_count: u64,
+    pub leak_date: u16,
     pub schema_mapping: String,
 }
 
 fn create_client() -> Client {
     Client::default()
-        .with_url("http://127.0.0.0:8123")
-        .with_user("default")
-        .with_password("")
+        .with_url("http://127.0.0.1:8123")
+        .with_user("admin")
+        .with_password("qwerty123")
         .with_database("aura")
 }
 
@@ -79,16 +79,12 @@ fn phone(phone_number: &str) -> String {
     }
 
     // 3. Нормализуем первую цифру (7 или 8 переводим в 8)
-    if digits.starts_with('7') || digits.starts_with('8') && digits.len() == 11 {
+    if (digits.starts_with('7') || digits.starts_with('8')) && digits.len() == 11 {
         return format!("7{}", &digits[1..]);
     } else {
         digits
     }
 }
-
-// fn fio(fio: Vec<String>) -> Vec<String>{
-
-// }
 
 fn parse_birth(birth_str: &str) -> (u16, u8, u8) {
     // Разбиваем по '-', '.', '/'
@@ -113,52 +109,159 @@ fn parse_birth(birth_str: &str) -> (u16, u8, u8) {
     }
 }
 
-fn parse_row_to_person(row: &csv::ByteRecord, column_mapping: &ColumnMapping) -> Person {
-    let raw_birth = row
-        .get(5)
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
+fn date_to_days(date_str: &str) -> u16 {
+    let parts: Vec<u32> = date_str
+        .split('-')
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect();
+
+    if let [year, month, day] = parts.as_slice() {
+        // Простой алгоритм вычисления дней от эпохи Unix
+        let (y, m) = if *month <= 2 {
+            (year - 1, month + 9)
+        } else {
+            (*year, month - 3)
+        };
+        let c = y / 100;
+        let ya = y - 100 * c;
+        let days_from_civil = (146097 * c) / 4 + (1461 * ya) / 4 + (153 * m + 2) / 5 + day - 1;
+        // 719468 — смещение дней от 0000-03-01 до 1970-01-01
+        if days_from_civil >= 719468 {
+            (days_from_civil - 719468) as u16
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+fn parse_row_to_person(
+    row: &csv::ByteRecord,
+    column_mapping: &ColumnMapping,
+    unused_idx: &Vec<usize>,
+    source_id: &String,
+) -> Person {
+    let raw_birth = if column_mapping.birth_date != None {
+        row.get(column_mapping.birth_date.unwrap())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
+    } else {
+        "".to_string()
+    };
     let (year, month, day) = parse_birth(&raw_birth);
 
-    let used = [2, 3, 4, 7, 8];
-
-    let extra_collect: Vec<String> = Vec::new();
-
-    let current_person = Person {
-        phone: row
-            .get(7)
+    let mut extra_collect: Vec<String> = Vec::with_capacity(unused_idx.len());
+    for &idx in unused_idx {
+        let val = row
+            .get(idx)
             .and_then(|b| std::str::from_utf8(b).ok())
             .map(|s| s.trim())
-            .map(|s| phone(s))
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0),
-        email: row
-            .get(8)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_default(),
-        surname: row
-            .get(2)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_default(),
+            .unwrap_or("");
+        extra_collect.push(val.to_string());
+    }
+    let extra_json = serde_json::to_string(&extra_collect).ok();
+    let current_person = Person {
+        source_id: source_id.clone(),
+        phone: if column_mapping.phone != None {
+            row.get(column_mapping.phone.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim())
+                .map(|s| phone(s))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        },
+        email: if column_mapping.email != None {
+            row.get(column_mapping.email.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+        surname: if column_mapping.surname != None {
+            row.get(column_mapping.surname.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
         // .map(|s| s.to_string()),
-        name: row
-            .get(3)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_default(),
+        name: if column_mapping.name != None {
+            row.get(column_mapping.name.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
         // .map(|s| s.to_string()),
-        patronymic: row
-            .get(4)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_default(),
-
+        patronymic: if column_mapping.patronymic != None {
+            row.get(column_mapping.patronymic.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+        extra: extra_json.unwrap(),
         // birth
         birth_day: day,
         birth_month: month,
         birth_year: year,
+
+        passport: if column_mapping.passport != None {
+            row.get(column_mapping.passport.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+
+        inn: if column_mapping.inn != None {
+            row.get(column_mapping.inn.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+
+        snils: if column_mapping.snils != None {
+            row.get(column_mapping.snils.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+
+        car_number: if column_mapping.car_number != None {
+            row.get(column_mapping.car_number.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+
+        telegram_id: if column_mapping.telegram_id != None {
+            row.get(column_mapping.telegram_id.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim())
+                .unwrap_or_default()
+                .parse::<i64>()
+                .unwrap_or_default()
+        } else {
+            0
+        },
 
         ..Default::default()
     };
@@ -166,31 +269,39 @@ fn parse_row_to_person(row: &csv::ByteRecord, column_mapping: &ColumnMapping) ->
     current_person
 }
 
-async fn db_reader(db_name: &str, column_mapping: &ColumnMapping) -> Result<(), Box<dyn Error>> {
+async fn db_reader(
+    db_name: &str,
+    column_mapping: &ColumnMapping,
+    unused_idx: &Vec<usize>,
+    source_id: &String,
+) -> Result<(), Box<dyn Error>> {
     println!("Начало читки файла!");
     let mut raw_chunk: Vec<csv::ByteRecord> = Vec::with_capacity(100_000);
     let db = File::open(db_name)?;
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b';')
+        .has_headers(true)
         .from_reader(BufReader::with_capacity(4 * 1024 * 1024, db));
 
-    let mut record = csv::ByteRecord::new();
+    // Скип заголовка
+    let mut byte_headers = csv::ByteRecord::new();
+    rdr.read_byte_record(&mut byte_headers)?;
 
+    let mut record = csv::ByteRecord::new();
+    let client = create_client();
     while rdr.read_byte_record(&mut record)? {
         raw_chunk.push(record.clone());
         if raw_chunk.len() == 100_000 {
-            println!("Пошла обработка миллиона!");
+            println!("Пошла обработка 100.000!");
             let processed_chunk: Vec<Person> = raw_chunk
                 .par_iter()
-                .map(|row| parse_row_to_person(row, column_mapping))
+                .map(|row| parse_row_to_person(row, column_mapping, unused_idx, source_id))
                 .collect();
 
             println!(
                 "Чанк на {} строк успешно обработан в многопотоке!",
                 processed_chunk.len()
             );
-
-            let client = create_client();
             push_to_click_db(&client, processed_chunk).await;
 
             println!("Чанк загружен в DB!");
@@ -199,15 +310,16 @@ async fn db_reader(db_name: &str, column_mapping: &ColumnMapping) -> Result<(), 
         }
     }
     if !raw_chunk.is_empty() {
-        println!("Пошла обработка 10000!");
+        println!("Пошла обработка Остатка!");
         let processed_chunk: Vec<Person> = raw_chunk
             .par_iter()
-            .map(|record| parse_row_to_person(record))
+            .map(|record| parse_row_to_person(record, column_mapping, unused_idx, source_id))
             .collect();
         println!(
             "Чанк на {} строк успешно обработан в многопотоке!",
             processed_chunk.len()
         );
+        push_to_click_db(&client, processed_chunk).await;
         raw_chunk.clear();
     }
 
@@ -222,10 +334,16 @@ async fn push_to_click_db(client: &clickhouse::Client, push_vec: Vec<Person>) {
     insert.end().await.unwrap();
 }
 
-async fn get_meta(name: String, description: String, leak_date: String) {}
+async fn push_sources_info_to_click_db(client: &clickhouse::Client, pushing_info: Meta) {
+    let mut insert = client.insert::<Meta>("sources_info").await.unwrap();
+    insert.write(&pushing_info).await.unwrap();
+    insert.end().await.unwrap();
+}
 
 fn ask(prompt: &str) -> String {
     print!("{}", prompt);
+    io::stdout().flush().ok();
+
     let mut s = String::new();
     std::io::stdin().read_line(&mut s).ok();
     s.trim().to_string()
@@ -241,27 +359,34 @@ fn ask_idx(prompt: &str) -> Option<usize> {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let db_name = ask("name:");
     let description = ask("description:");
-    let leak_date = ask("leak_date (YYYY-MM-DD):");
+    let leak_date = date_to_days(&ask("leak_date (YYYY-MM-DD):"));
     let db_path = ask("DB path (trash-dbs/cdek2021/):");
-    let source_id = Path::new(&db_path)
+    let source_id: String = Path::new(&db_path)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
 
     println!("Start parsing!");
     let mut is_first: bool = true;
     let mut headers: Vec<String> = Vec::new();
     let mut column_mapping: ColumnMapping = ColumnMapping::default();
+    let mut meta_info: Meta = Meta::default();
+    let mut used_idx: Vec<usize> = Vec::new();
     // [id, fio....] from csv
+    let mut unused_idx: Vec<usize> = Vec::new();
+    let mut unused_headers: Vec<String> = Vec::new();
 
     for part in fs::read_dir(&db_path).unwrap() {
         let path_db = part.unwrap().path();
         if is_first {
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(false)
+            let rdr = csv::ReaderBuilder::new()
+                .delimiter(b';')
+                .has_headers(true)
                 .from_path(&path_db);
             headers = rdr
                 .unwrap()
@@ -315,10 +440,60 @@ fn main() {
                 car_number: car_number,
                 telegram_id: telegram_id,
             };
+
+            let m = column_mapping.clone();
+            used_idx = [
+                m.fio,
+                m.name,
+                m.surname,
+                m.patronymic,
+                m.phone,
+                m.email,
+                m.passport,
+                m.inn,
+                m.snils,
+                m.birth_date,
+                m.car_number,
+                m.telegram_id,
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+
+            for (idx, header_name) in headers.iter().enumerate() {
+                if !used_idx.contains(&idx) {
+                    unused_idx.push(idx);
+                    unused_headers.push(header_name.trim().to_lowercase());
+                }
+            }
+
+            let schema_mapping = serde_json::to_string(&unused_headers).unwrap_or_default();
+
+            meta_info = Meta {
+                source_id: source_id.clone(),
+                name: db_name.to_string(),
+                description: description.to_string(),
+                leak_date: leak_date,
+                schema_mapping: schema_mapping,
+            };
+            let client = create_client();
+            push_sources_info_to_click_db(&client, meta_info).await;
         }
 
         is_first = false;
-        db_reader(path_db.to_str().unwrap(), &column_mapping);
+        if db_reader(
+            path_db.to_str().unwrap(),
+            &column_mapping,
+            &unused_idx,
+            &source_id,
+        )
+        .await
+        .is_ok()
+        {
+            println!("Success");
+        } else {
+            println!("Error");
+        }
     }
 
     // match db_reader("trash-dbs/test_full.csv") {
