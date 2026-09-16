@@ -1,3 +1,4 @@
+use chrono::{DateTime, Datelike};
 use clickhouse::{Client, Row};
 use core::str;
 use rayon::prelude::*;
@@ -8,7 +9,7 @@ use std::path::Path;
 use std::{clone, fs, io};
 use std::{error::Error, fs::File, print, println};
 
-#[derive(Debug, Default, clickhouse::Row, serde::Serialize)]
+#[derive(Debug, Default, clickhouse::Row, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
 // #[derive(Debug, Default)]
 pub struct Person {
     pub phone: u64,
@@ -41,6 +42,7 @@ pub struct ColumnMapping {
     pub patronymic: Option<usize>,
     pub phone: Option<usize>,
     pub email: Option<usize>,
+    pub username: Option<usize>,
     pub passport: Option<usize>,
     pub inn: Option<usize>,
     pub snils: Option<usize>,
@@ -87,19 +89,24 @@ fn phone(phone_number: &str) -> String {
 }
 
 fn parse_birth(birth_str: &str) -> (u16, u8, u8) {
-    // Разбиваем по '-', '.', '/'
-    let parts: Vec<&str> = birth_str
+    // 1. Убираем пробелы, \r, \n и кавычки по краям
+    let clean = birth_str.trim().trim_matches(|c| c == '"' || c == '\'');
+
+    // 2. Если там прилипло время ("01.07.1991 00:00:00"), берем только дату
+    let date_part = clean.split_whitespace().next().unwrap_or("");
+
+    let parts: Vec<&str> = date_part
         .split(|c| c == '-' || c == '.' || c == '/')
         .collect();
 
     match parts.as_slice() {
-        // Если дата пришла как YYYY-MM-DD
+        // Формат: YYYY-MM-DD -> (Год, Месяц, День)
         [y, m, d] if y.len() == 4 => (
             y.parse::<u16>().unwrap_or(0),
             m.parse::<u8>().unwrap_or(0),
             d.parse::<u8>().unwrap_or(0),
         ),
-        // Если дата пришла как DD-MM-YYYY
+        // Формат: DD-MM-YYYY -> (Год, Месяц, День)
         [d, m, y] if y.len() == 4 => (
             y.parse::<u16>().unwrap_or(0),
             m.parse::<u8>().unwrap_or(0),
@@ -107,6 +114,16 @@ fn parse_birth(birth_str: &str) -> (u16, u8, u8) {
         ),
         _ => (0, 0, 0),
     }
+}
+
+fn parse_unix_birthday(ts_str: &str) -> (u16, u8, u8) {
+    ts_str
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(|ts| DateTime::from_timestamp(ts + 3 * 3600, 0)) // +3 часа под MSK
+        .map(|dt| (dt.year() as u16, dt.month() as u8, dt.day() as u8))
+        .unwrap_or((0, 0, 0))
 }
 
 fn date_to_days(date_str: &str) -> u16 {
@@ -149,7 +166,14 @@ fn parse_row_to_person(
     } else {
         "".to_string()
     };
-    let (year, month, day) = parse_birth(&raw_birth);
+
+    let (year, month, day) = if raw_birth.trim().is_empty() {
+        (0, 0, 0)
+    } else if !(raw_birth.contains('.') || raw_birth.contains('-') || raw_birth.contains('/')) {
+        parse_unix_birthday(&raw_birth)
+    } else {
+        parse_birth(&raw_birth)
+    };
 
     let mut extra_collect: Vec<String> = Vec::with_capacity(unused_idx.len());
     for &idx in unused_idx {
@@ -161,6 +185,30 @@ fn parse_row_to_person(
         extra_collect.push(val.to_string());
     }
     let extra_json = serde_json::to_string(&extra_collect).ok();
+    let mut surname = String::new();
+    let mut name = String::new();
+    let mut patronymic = String::new();
+
+    if let Some(fio_idx) = column_mapping.fio {
+        if let Some(bytes) = row.get(fio_idx) {
+            let raw_fio = String::from_utf8_lossy(bytes);
+            let mut parts = raw_fio.split_whitespace();
+
+            // 1-е слово: Фамилия
+            if let Some(s) = parts.next() {
+                surname = s.trim().to_string();
+            }
+            // 2-е слово: Имя
+            if let Some(n) = parts.next() {
+                name = n.trim().to_string();
+            }
+            // 3-е слово (и всё, что дальше, если двойное): Отчество
+            let rest: Vec<&str> = parts.collect();
+            if !rest.is_empty() {
+                patronymic = rest.join(" ");
+            }
+        }
+    }
     let current_person = Person {
         source_id: source_id.clone(),
         phone: if column_mapping.phone != None {
@@ -181,11 +229,21 @@ fn parse_row_to_person(
         } else {
             String::new()
         },
+        username: if column_mapping.username != None {
+            row.get(column_mapping.username.unwrap())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
         surname: if column_mapping.surname != None {
             row.get(column_mapping.surname.unwrap())
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(|s| s.trim().to_lowercase())
                 .unwrap_or_default()
+        } else if !surname.is_empty() {
+            surname
         } else {
             String::new()
         },
@@ -195,6 +253,8 @@ fn parse_row_to_person(
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(|s| s.trim().to_lowercase())
                 .unwrap_or_default()
+        } else if !name.is_empty() {
+            name
         } else {
             String::new()
         },
@@ -204,6 +264,8 @@ fn parse_row_to_person(
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(|s| s.trim().to_lowercase())
                 .unwrap_or_default()
+        } else if !patronymic.is_empty() {
+            patronymic
         } else {
             String::new()
         },
@@ -219,6 +281,9 @@ fn parse_row_to_person(
                 .map(|s| s.trim())
                 .map(|s| s.to_lowercase())
                 .unwrap_or_default()
+                .chars()
+                .take(10)
+                .collect()
         } else {
             String::new()
         },
@@ -274,44 +339,52 @@ async fn db_reader(
     column_mapping: &ColumnMapping,
     unused_idx: &Vec<usize>,
     source_id: &String,
+    delimiter: u8,
 ) -> Result<(), Box<dyn Error>> {
     println!("Начало читки файла!");
     let mut raw_chunk: Vec<csv::ByteRecord> = Vec::with_capacity(100_000);
     let db = File::open(db_name)?;
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b';')
+        .delimiter(delimiter)
         .has_headers(true)
+        .flexible(true) // разрешает кривые длины строк
+        .quoting(false)
         .from_reader(BufReader::with_capacity(4 * 1024 * 1024, db));
-
-    // Скип заголовка
-    let mut byte_headers = csv::ByteRecord::new();
-    rdr.read_byte_record(&mut byte_headers)?;
 
     let mut record = csv::ByteRecord::new();
     let client = create_client();
-    while rdr.read_byte_record(&mut record)? {
+
+    while let Ok(true) = rdr.read_byte_record(&mut record) {
         raw_chunk.push(record.clone());
         if raw_chunk.len() == 100_000 {
             println!("Пошла обработка 100.000!");
-            let processed_chunk: Vec<Person> = raw_chunk
+            let mut processed_chunk: Vec<Person> = raw_chunk
                 .par_iter()
                 .map(|row| parse_row_to_person(row, column_mapping, unused_idx, source_id))
                 .collect();
-
+            processed_chunk.par_sort_unstable();
             println!(
                 "Чанк на {} строк успешно обработан в многопотоке!",
                 processed_chunk.len()
             );
-            push_to_click_db(&client, processed_chunk).await;
+            let len_before = processed_chunk.len();
+            processed_chunk.dedup();
+            let len_after = processed_chunk.len();
 
-            println!("Чанк загружен в DB!");
+            println!(
+                "Удалено дублей в батче: {} (осталось {})",
+                len_before - len_after,
+                len_after
+            );
+            push_to_click_db(&client, processed_chunk).await;
+            println!("Чанк загружен в DB!\n");
 
             raw_chunk.clear();
         }
     }
     if !raw_chunk.is_empty() {
         println!("Пошла обработка Остатка!");
-        let processed_chunk: Vec<Person> = raw_chunk
+        let mut processed_chunk: Vec<Person> = raw_chunk
             .par_iter()
             .map(|record| parse_row_to_person(record, column_mapping, unused_idx, source_id))
             .collect();
@@ -319,7 +392,18 @@ async fn db_reader(
             "Чанк на {} строк успешно обработан в многопотоке!",
             processed_chunk.len()
         );
+        processed_chunk.sort(); // реализуй Ord / Eq для Person
+        let len_before = processed_chunk.len();
+        processed_chunk.dedup();
+        let len_after = processed_chunk.len();
+
+        println!(
+            "Удалено дублей в батче: {} (осталось {})",
+            len_before - len_after,
+            len_after
+        );
         push_to_click_db(&client, processed_chunk).await;
+        println!("Чанк загружен в DB!\n");
         raw_chunk.clear();
     }
 
@@ -339,6 +423,15 @@ async fn push_sources_info_to_click_db(client: &clickhouse::Client, pushing_info
     insert.write(&pushing_info).await.unwrap();
     insert.end().await.unwrap();
 }
+
+// fn detect_delimiter(header_line: &str) -> u8 {
+//     let delimiters = [b'\t', b',', b';', b'|'];
+
+//     delimiters
+//         .into_iter()
+//         .max_by_key(|&d| header_line.as_bytes().iter().filter(|&&b| b == d).count())
+//         .unwrap_or(b',')
+// }
 
 fn ask(prompt: &str) -> String {
     print!("{}", prompt);
@@ -365,6 +458,10 @@ async fn main() {
     let description = ask("description:");
     let leak_date = date_to_days(&ask("leak_date (YYYY-MM-DD):"));
     let db_path = ask("DB path (trash-dbs/cdek2021/):");
+    let mut delimiter = ask("delimiter (default: tab):");
+    if delimiter.is_empty() {
+        delimiter = "\t".to_string();
+    }
     let source_id: String = Path::new(&db_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -385,15 +482,15 @@ async fn main() {
         let path_db = part.unwrap().path();
         if is_first {
             let rdr = csv::ReaderBuilder::new()
-                .delimiter(b';')
+                .delimiter(delimiter.as_bytes()[0])
                 .has_headers(true)
                 .from_path(&path_db);
             headers = rdr
                 .unwrap()
-                .headers()
+                .byte_headers()
                 .unwrap()
                 .iter()
-                .map(|s| s.to_string())
+                .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
                 .collect();
 
             // creating map for headers, aka name=1,surname=2,emain=7,number=8
@@ -418,7 +515,8 @@ async fn main() {
             }
 
             let phone = ask_idx("mobile phone: ");
-            let email = ask_idx("email phone: ");
+            let email = ask_idx("email: ");
+            let username = ask_idx("username: ");
             let passport = ask_idx("passport: ");
             let inn = ask_idx("inn: ");
             let snils = ask_idx("snils: ");
@@ -433,6 +531,7 @@ async fn main() {
                 patronymic: patronymic,
                 phone: phone,
                 email: email,
+                username: username,
                 passport: passport,
                 inn: inn,
                 snils: snils,
@@ -449,6 +548,7 @@ async fn main() {
                 m.patronymic,
                 m.phone,
                 m.email,
+                m.username,
                 m.passport,
                 m.inn,
                 m.snils,
@@ -486,6 +586,7 @@ async fn main() {
             &column_mapping,
             &unused_idx,
             &source_id,
+            delimiter.as_bytes()[0],
         )
         .await
         .is_ok()
