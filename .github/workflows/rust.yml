@@ -11,14 +11,18 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --release --verbose
       working-directory: ./db_formatter_rust
     - name: Run tests
       run: cargo test --verbose
       working-directory: ./db_formatter_rust
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v7.0.2
+      with:
+        name: db-formatter-linux
+        path: db_formatter_rust/target/release/db_formatter_rust
